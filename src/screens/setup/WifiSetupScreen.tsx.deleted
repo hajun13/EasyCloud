@@ -1,0 +1,1023 @@
+import React, { useState, useContext, useEffect, useCallback } from 'react';
+import { 
+  View, 
+  Text, 
+  StyleSheet, 
+  ScrollView,
+  KeyboardAvoidingView,
+  Platform,
+  Alert,
+  ActivityIndicator,
+  TouchableOpacity,
+  RefreshControl,
+  Modal
+} from 'react-native';
+import { useNavigation, NavigationProp } from '@react-navigation/native';
+import Input from '../../components/common/Input';
+import LoadingSpinner from '../../components/common/LoadingSpinner';
+import Header from '../../components/common/Header';
+import { DeviceContext } from '../../contexts/DeviceContext';
+import Colors from '../../constants/colors';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import deviceService from '../../services/deviceService';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { saveDeviceURL } from '../../utils/apiClient';
+import { storeData } from '../../utils/storage';
+
+// 16진수 이스케이프 시퀀스를 실제 문자로 변환하는 함수
+const decodeHexEscapeSequence = (str: string): string => {
+  if (!str) return '';
+  
+  // 일반적인 URL 디코딩 시도
+  let decodedStr = str;
+  try {
+    if (decodedStr.includes('%')) {
+      decodedStr = decodeURIComponent(decodedStr);
+    }
+  } catch (e) {
+    console.warn('URL 디코딩 실패:', e);
+  }
+  
+  // \x 이스케이프 시퀀스 처리
+  try {
+    if (decodedStr.includes('\\x')) {
+      // \x 이스케이프 시퀀스를 실제 바이트로 변환
+      const hexStr = decodedStr.replace(/\\x([0-9A-Fa-f]{2})/g, (_, hex) => {
+        return String.fromCharCode(parseInt(hex, 16));
+      });
+      
+      // UTF-8 바이트 배열을 문자열로 변환 시도
+      try {
+        // TextEncoder/TextDecoder API가 있는지 확인
+        if (typeof TextDecoder !== 'undefined') {
+          const bytes = new Uint8Array(hexStr.length);
+          for (let i = 0; i < hexStr.length; i++) {
+            bytes[i] = hexStr.charCodeAt(i);
+          }
+          const decoder = new TextDecoder('utf-8');
+          return decoder.decode(bytes);
+        } else {
+          // 레거시 지원
+          return hexStr;
+        }
+      } catch (e) {
+        console.warn('UTF-8 디코딩 실패:', e);
+        return hexStr;
+      }
+    }
+  } catch (e) {
+    console.warn('이스케이프 시퀀스 디코딩 실패:', e);
+  }
+  
+  return decodedStr;
+};
+
+
+// WiFi 네트워크 인터페이스
+interface WifiNetwork {
+  ssid: string;
+  ssid_raw?: string; // 원본 SSID 형식 (인코딩을 위해 추가)
+  signal_strength: number | null;
+  security: string;
+  channel: number | null;
+  mac_address: string | null;
+  connected?: boolean; // 현재 연결된 네트워크인지 여부
+}
+
+// 기기 정보 타입 정의
+interface DeviceInfo {
+  device_id: string;
+  local_ip: string;
+  [key: string]: any; // 추가 속성이 있을 수 있음
+}
+
+// 컨텍스트 타입 정의
+interface DeviceContextType {
+  setupWifi: (ssid: string, password: string) => Promise<boolean>;
+  deviceInfo: DeviceInfo | null;
+  loading: boolean;
+  refreshDeviceStatus: () => Promise<void>;
+}
+
+// 에러 상태 타입 정의
+interface FormErrors {
+  ssid: string;
+  password: string;
+}
+
+// 네비게이션 타입 정의
+type RootStackParamList = {
+  HomeTab: undefined;
+  // 다른 라우트 추가 가능
+};
+
+const WifiSetupScreen = () => {
+  const navigation = useNavigation<NavigationProp<RootStackParamList>>();
+  const { setupWifi, deviceInfo, loading, refreshDeviceStatus, connectDevice  } = useContext(DeviceContext) as DeviceContextType;
+  
+  const [ssid, setSsid] = useState('');
+  const [password, setPassword] = useState('');
+  const [errors, setErrors] = useState<FormErrors>({ ssid: '', password: '' });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isTestingConnection, setIsTestingConnection] = useState(false);
+  const [localDeviceInfo, setLocalDeviceInfo] = useState<DeviceInfo | null>(null);
+  
+  // WiFi 스캔 관련 상태
+  const [networks, setNetworks] = useState<WifiNetwork[]>([]);
+  const [isScanning, setIsScanning] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [showNetworkList, setShowNetworkList] = useState(false);
+  
+  // 컴포넌트 마운트 시 디버깅 로그 추가
+  useEffect(() => {
+    console.log('🔍 WifiSetupScreen 컴포넌트 마운트됨');
+    console.log('📱 deviceInfo:', deviceInfo);
+    console.log('🔄 loading 상태:', loading);
+    
+    // 로컬 스토리지에서 QR 데이터 확인 (웹/네이티브 환경 모두 대응)
+    const getStoredDeviceInfo = async () => {
+      try {
+        let storedDeviceInfo = null;
+        
+        if (Platform.OS === 'web' && typeof window !== 'undefined' && window.localStorage) {
+          // 웹 환경
+          storedDeviceInfo = localStorage.getItem('deviceInfo');
+          console.log('💾 웹 로컬 스토리지 deviceInfo:', storedDeviceInfo);
+        } else {
+          // 네이티브 환경
+          storedDeviceInfo = await AsyncStorage.getItem('deviceInfo');
+          console.log('💾 AsyncStorage deviceInfo:', storedDeviceInfo);
+        }
+        
+        // 기기 정보가 컨텍스트에 없지만 로컬 스토리지에 있으면 사용
+        if (!deviceInfo && storedDeviceInfo) {
+          try {
+            const parsedDeviceInfo = JSON.parse(storedDeviceInfo);
+            console.log('📋 로컬 스토리지에서 복원한 기기 정보:', parsedDeviceInfo);
+            setLocalDeviceInfo(parsedDeviceInfo);
+          } catch (error) {
+            console.error('❌ 기기 정보 파싱 오류:', error);
+          }
+        }
+      } catch (error) {
+        console.error('❌ 저장소 접근 오류:', error);
+      }
+    };
+    
+    getStoredDeviceInfo();
+    
+    // 화면이 마운트될 때 자동으로 WiFi 스캔 시작
+    scanWifiNetworks();
+    
+    return () => {
+      console.log('🔍 WifiSetupScreen 컴포넌트 언마운트됨');
+    };
+  }, [deviceInfo, loading]);
+  
+  // WiFi 스캔 함수 - 디버깅 및 한글 처리 개선
+  const scanWifiNetworks = useCallback(async () => {
+    console.log('📡 WiFi 네트워크 스캔 시작');
+    setIsScanning(true);
+    
+    try {
+      const result = await deviceService.scanWifiNetworks();
+      
+      if (result.success && result.networks) {
+        console.log('✅ WiFi 스캔 성공:', result.networks.length, '개의 네트워크 발견');
+        console.log('전체 네트워크 받은 데이터:', result.networks);
+        
+        // 한글 SSID 가 있는지 확인
+        const hasKoreanSSID = result.networks.some(network => {
+          // URL 인코딩된 한글이 있는지 체크
+          return network.ssid && network.ssid.includes('%E');
+        });
+        
+        console.log('한글 SSID 포함 확인:', hasKoreanSSID);
+        
+        // 한글 SSID 원본과 인코딩된 값 출력
+        result.networks.forEach((network, idx) => {
+          if (network.ssid && network.ssid.includes('%')) {
+            try {
+              const decoded = decodeURIComponent(network.ssid);
+              console.log(`네트워크 ${idx+1} 디코딩:`, {
+                original: network.ssid,
+                decoded: decoded,
+                raw: network.ssid_raw
+              });
+            } catch (e) {
+              console.warn(`네트워크 ${idx+1} 디코딩 오류:`, e);
+            }
+          }
+        });
+        
+        setNetworks(result.networks);
+        setShowNetworkList(true);
+      } else {
+        console.error('❌ WiFi 스캔 실패:', result.message);
+        // 웹 환경과 네이티브 환경에 맞는 알림 표시
+        if (Platform.OS === 'web') {
+          window.alert(`WiFi 스캔 실패: ${result.message || '네트워크 오류'}`);
+        } else {
+          Alert.alert(
+            'WiFi 스캔 실패',
+            result.message || '네트워크 오류가 발생했습니다',
+            [{ text: '확인' }]
+          );
+        }
+      }
+    } catch (error) {
+      console.error('❌ WiFi 스캔 오류:', error);
+    } finally {
+      setIsScanning(false);
+      setRefreshing(false);
+    }
+  }, []);
+  
+  // 새로고침 처리
+  const handleRefresh = useCallback(() => {
+    setRefreshing(true);
+    scanWifiNetworks();
+  }, [scanWifiNetworks]);
+  
+  // WiFi 선택 처리 - 한글 인코딩 문제 처리 개선
+  const handleSelectNetwork = useCallback((network: WifiNetwork) => {
+    // 디코딩 시도 (SSID가 한글이나 인코딩된 문자인 경우)
+    let decodedSsid = network.ssid;
+    console.log('🔘 선택된 원본 WiFi SSID:', network.ssid);
+    
+    // 1. URL 인코딩된 경우 디코딩
+    try {
+      if (network.ssid && network.ssid.includes('%')) {
+        decodedSsid = decodeURIComponent(network.ssid);
+        console.log('URL 디코딩된 SSID:', decodedSsid);
+      }
+    } catch (e) {
+      console.warn('URL 디코딩 실패:', e);
+    }
+    
+    // 2. 이스케이프 시퀀스(\x) 처리
+    try {
+      // 원본 SSID 이스케이프 시퀀스 처리 
+      if (network.ssid_raw && network.ssid_raw.includes('\\x')) {
+        const properSsid = decodeHexEscapeSequence(network.ssid_raw);
+        console.log('16진수 이스케이프 시퀀스 디코딩:', properSsid);
+        decodedSsid = properSsid; // 더 정확한 결과 사용
+      }
+      // 디코딩된 SSID에도 이스케이프 시퀀스가 있는 경우
+      else if (decodedSsid && decodedSsid.includes('\\x')) {
+        decodedSsid = decodeHexEscapeSequence(decodedSsid);
+        console.log('디코딩된 SSID의 이스케이프 시퀀스 처리:', decodedSsid);
+      }
+    } catch (e) {
+      console.warn('이스케이프 시퀀스 디코딩 실패:', e);
+    }
+    
+    console.log('최종 사용할 한글 SSID:', decodedSsid);
+    
+    // SSID 설정
+    setSsid(decodedSsid);
+    setShowNetworkList(false);
+    
+    // 보안 방식이 OPEN인 경우 비밀번호 필요 없음
+    if (network.security === 'OPEN') {
+      setPassword('');
+    }
+  }, []);
+  
+  // 신호 강도 바 아이콘 결정
+  const getSignalIcon = (strength: number | null) => {
+    if (strength === null) return 'wifi-outline';
+    
+    // dBm 값을 백분율로 변환 (일반적으로 -50dBm은 100%, -100dBm은 0%로 간주)
+    const percentage = Math.max(0, Math.min(100, ((strength + 100) * 2)));
+    
+    if (percentage >= 70) return 'wifi';
+    if (percentage >= 40) return 'wifi-outline';
+    return 'wifi-outline';
+  };
+  
+  // 보안 타입 아이콘 결정
+  const getSecurityIcon = (security: string) => {
+    switch (security) {
+      case 'WPA2':
+      case 'WPA':
+        return 'lock-closed';
+      case 'WEP':
+        return 'lock-open';
+      case 'OPEN':
+        return 'globe';
+      default:
+        return 'help-circle';
+    }
+  };
+  
+  const validateForm = (): boolean => {
+    console.log('🔍 폼 유효성 검사 시작');
+    let isValid = true;
+    const newErrors = { ssid: '', password: '' };
+    
+    if (!ssid) {
+      newErrors.ssid = 'WiFi 이름을 입력해주세요';
+      isValid = false;
+    }
+    
+    // 비밀번호는 선택적으로 허용 (오픈 네트워크 지원)
+    
+    setErrors(newErrors);
+    console.log('🔍 폼 유효성 검사 결과:', isValid);
+    return isValid;
+  };
+  
+  const handleSetupWifi = async () => {
+    console.log('🔘 WiFi 설정 버튼 클릭됨');
+  
+    if (!validateForm()) {
+      console.log('❌ 폼 유효성 검사 실패');
+      return;
+    }
+  
+    console.log('✅ 폼 유효성 검사 성공');
+    setIsSubmitting(true);
+  
+    try {
+      console.log('🔄 setupWifi 호출 시작:', { ssid, password: '********' });
+      const response = await deviceService.setupWifi({ ssid, password });
+      console.log('🔄 WiFi 설정 응답:', response);
+  
+      if (response && response.success) {
+        setIsTestingConnection(true);
+  
+        Alert.alert(
+          'WiFi 설정 완료',
+          '기기가 새로운 WiFi 네트워크에 연결 중입니다. 잠시 후 기기 상태를 확인합니다.',
+          [{ text: '확인' }]
+        );
+  
+        console.log('⏱️ 연결 테스트 대기 시작');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        console.log('⏱️ 연결 테스트 대기 완료');
+  
+        try {
+          let newDeviceInfo = null;
+          let attempts = 0;
+          const maxAttempts = 3;
+  
+          while (attempts < maxAttempts) {
+            try {
+              console.log(`🔄 새 IP 주소 확인 시도 ${attempts + 1}/${maxAttempts}`);
+              newDeviceInfo = await deviceService.getDeviceInfo();
+  
+              if (newDeviceInfo && newDeviceInfo.local_ip) {
+                console.log('✅ 새 IP 주소 확인 성공:', newDeviceInfo.local_ip);
+                break;
+              }
+            } catch (error) {
+              console.log(`⚠️ 시도 ${attempts + 1} 실패:`, error);
+            }
+  
+            attempts++;
+            if (attempts < maxAttempts) {
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+          }
+  
+          if (newDeviceInfo && newDeviceInfo.local_ip) {
+            const newBaseUrl = `http://${newDeviceInfo.local_ip}:8000`;
+            console.log('🌐 새 IP 주소로 baseURL 업데이트:', newBaseUrl);
+  
+            await saveDeviceURL(newBaseUrl);
+  
+            if (Platform.OS === 'web' && typeof window !== 'undefined') {
+              localStorage.setItem('deviceInfo', JSON.stringify(newDeviceInfo));
+              console.log('💾 웹 로컬 스토리지에 업데이트된 기기 정보 저장됨');
+            } else {
+              await storeData('deviceInfo', newDeviceInfo);
+            }
+  
+            if (connectDevice) {
+              await connectDevice(newDeviceInfo);
+            }
+  
+            console.log('🔄 기기 상태 새로고침 시작');
+            try {
+              await refreshDeviceStatus();
+              console.log('✅ 기기 상태 새로고침 성공');
+            } catch (refreshError) {
+              console.error('⚠️ 기기 상태 새로고침 실패, 하지만 계속 진행:', refreshError);
+            }
+  
+            if (Platform.OS === 'web') {
+              window.alert('WiFi 설정이 완료되었으며 기기가 정상적으로 연결되었습니다.');
+              try {
+                navigation.navigate('Main');
+              } catch (navError) {
+                console.error('⚠️ 네비게이션 오류, 홈으로 직접 이동:', navError);
+                window.location.href = '/';
+              }
+            } else {
+              Alert.alert(
+                '연결 성공',
+                'WiFi 설정이 완료되었으며 기기가 정상적으로 연결되었습니다.',
+                [{
+                  text: '확인',
+                  onPress: () => {
+                    console.log('🏠 홈 화면으로 이동 시도');
+                    try {
+                      navigation.navigate('Main');
+                    } catch (navError) {
+                      console.error('⚠️ 네비게이션 오류:', navError);
+                      navigation.goBack();
+                    }
+                  }
+                }]
+              );
+            }
+          } else {
+            throw new Error('새 IP 주소를 확인할 수 없습니다');
+          }
+        } catch (error) {
+          console.error('❌ 연결 테스트 오류:', error);
+  
+          if (Platform.OS === 'web') {
+            window.alert(`WiFi 설정은 적용되었지만 연결 테스트 중 오류가 발생했습니다: ${error.message}`);
+            window.location.href = '/';
+          } else {
+            Alert.alert(
+              '연결 테스트 실패',
+              'WiFi 설정은 적용되었지만, 기기 상태를 확인할 수 없습니다.',
+              [{
+                text: '확인',
+                onPress: () => {
+                  console.log('🏠 홈 화면으로 이동 (테스트 실패)');
+                  navigation.reset({
+                    index: 0,
+                    routes: [{ name: 'HomeTab' }]
+                  });
+                }
+              }]
+            );
+          }
+        }
+      } else {
+        console.log('❌ WiFi 설정 실패');
+        Alert.alert(
+          '설정 실패',
+          response.data?.message || 'WiFi 설정에 실패했습니다. 비밀번호를 확인하고 다시 시도해주세요.'
+        );
+      }
+    } catch (error) {
+      console.error('❌ WiFi 설정 오류:', error);
+      Alert.alert('오류', '네트워크 통신 중 오류가 발생했습니다.');
+    } finally {
+      setIsSubmitting(false);
+      setIsTestingConnection(false);
+    }
+  };  
+  
+  
+  const handleSkip = () => {
+    console.log('🔘 건너뛰기 버튼 클릭됨');
+    Alert.alert(
+      'WiFi 설정 건너뛰기',
+      'WiFi 설정을 건너뛰면 일부 기능이 제한될 수 있습니다. 계속하시겠습니까?',
+      [
+        { text: '취소', style: 'cancel' },
+        { 
+          text: '계속', 
+          onPress: () => {
+            console.log('🏠 홈 화면으로 이동 (건너뛰기)');
+            navigation.reset({
+              index: 0,
+              routes: [{ name: 'HomeTab' }]
+            });
+          }
+        }
+      ]
+    );
+  };
+  
+  // 홈으로 강제 이동 핸들러
+  const forceNavigateToHome = () => {
+    console.log('🔘 강제 이동 버튼 클릭됨');
+    navigation.reset({
+      index: 0,
+      routes: [{ name: 'HomeTab' }]
+    });
+  };
+  
+  if (loading) {
+    console.log('🔄 로딩 상태로 렌더링');
+    return <LoadingSpinner message="WiFi 설정 준비 중..." />;
+  }
+  
+  console.log('📄 WifiSetupScreen 렌더링');
+  
+  // 디바이스 정보 결정 (컨텍스트 또는 로컬)
+  const displayDeviceInfo = deviceInfo || localDeviceInfo;
+  
+  // WiFi 네트워크 목록 렌더링 - 한글 처리 개선
+  const renderNetworkList = () => {
+    console.log('💭 목록에 표시될 네트워크:', networks.length, '개');
+    
+    // 디버깅용: 모든 네트워크 정보 출력
+    networks.forEach((network, idx) => {
+      console.log(`네트워크 ${idx+1}:`, {
+        ssid: network.ssid,
+        ssid_raw: network.ssid_raw,
+        security: network.security,
+        connected: network.connected
+      });
+    });
+    
+    if (networks.length === 0 && !isScanning) {
+      return (
+        <View style={styles.emptyNetworkContainer}>
+          <Text style={styles.emptyNetworkText}>발견된 WiFi 네트워크가 없습니다</Text>
+          <TouchableOpacity 
+            style={styles.refreshButton}
+            onPress={scanWifiNetworks}
+            activeOpacity={0.7}
+          >
+            <Text style={styles.refreshButtonText}>다시 스캔하기</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    
+    return (
+      <View style={styles.networkListContainer}>
+        {isScanning && (
+          <View style={styles.scanningIndicator}>
+            <ActivityIndicator size="small" color={Colors.primary} />
+            <Text style={styles.scanningText}>WiFi 네트워크 스캔 중...</Text>
+          </View>
+        )}
+        
+        {networks.map((network, index) => {
+          // 한글 SSID 처리
+          let displayName = network.ssid;
+          try {
+            // 1. URL 인코딩이 된 경우 디코딩 시도
+            if (network.ssid && network.ssid.includes('%')) {
+              displayName = decodeURIComponent(network.ssid);
+            }
+            
+            // 2. 확인한 원본 데이터에서 이스케이프 시퀀스 처리
+            if (network.ssid_raw && network.ssid_raw.includes('\\x')) {
+              displayName = decodeHexEscapeSequence(network.ssid_raw);
+              console.log(`네트워크 ${index+1} 한글 이름 복원:`, displayName);
+            }
+            // 디코딩된 값에도 이스케이프 시퀀스가 있는 경우
+            else if (displayName && displayName.includes('\\x')) {
+              displayName = decodeHexEscapeSequence(displayName);
+            }
+          } catch (e) {
+            console.warn(`네트워크 ${index+1} 디코딩 오류:`, e);
+            // 오류 발생 시 기본값 사용
+            displayName = network.ssid || '숨겨진 네트워크';
+          }
+          
+          return (
+            <TouchableOpacity
+              key={`${network.ssid}-${index}`}
+              style={styles.networkItem}
+              onPress={() => handleSelectNetwork(network)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.networkIconContainer}>
+                <Ionicons 
+                  name={getSignalIcon(network.signal_strength)} 
+                  size={24} 
+                  color={Colors.primary} 
+                />
+              </View>
+              <View style={styles.networkInfo}>
+                <Text style={styles.networkName}>{displayName || '숨겨진 네트워크'}</Text>
+                <View style={styles.networkDetails}>
+                  <Ionicons 
+                    name={getSecurityIcon(network.security)} 
+                    size={16} 
+                    color={Colors.darkGray} 
+                    style={styles.securityIcon}
+                  />
+                  <Text style={styles.networkSecurity}>{network.security}</Text>
+                </View>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={Colors.lightGray} />
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+    );
+  };
+  
+  return (
+    <KeyboardAvoidingView 
+      style={styles.container} 
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 64 : 0}
+    >
+      <Header title="WiFi 설정" showBackButton />
+      <ScrollView 
+        contentContainerStyle={styles.scrollContainer}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            onRefresh={handleRefresh}
+            colors={[Colors.primary]}
+            tintColor={Colors.primary}
+          />
+        }
+      >
+        <View style={styles.content}>
+          <Text style={styles.title}>WiFi 설정</Text>
+          {displayDeviceInfo && (
+            <View style={styles.deviceInfoContainer}>
+              <Text style={styles.deviceInfoTitle}>연결된 기기</Text>
+              <Text style={styles.deviceInfo}>
+                ID: {displayDeviceInfo.device_id}
+              </Text>
+              <Text style={styles.deviceInfo}>
+                IP: {displayDeviceInfo.local_ip}
+              </Text>
+            </View>
+          )}
+          
+          <Text style={styles.instructions}>
+            EasyCloud 기기가 인터넷에 연결할 수 있도록 WiFi 정보를 입력해주세요.
+          </Text>
+          
+          {/* WiFi 목록 표시 영역 */}
+          <View style={styles.wifiListContainer}>
+            <View style={styles.wifiListHeader}>
+              <Text style={styles.wifiListTitle}>주변 WiFi 네트워크</Text>
+              <TouchableOpacity 
+                onPress={scanWifiNetworks}
+                disabled={isScanning}
+                activeOpacity={0.7}
+                style={styles.scanButton}
+              >
+                <Ionicons 
+                  name="refresh" 
+                  size={20} 
+                  color={isScanning ? Colors.lightGray : Colors.primary} 
+                />
+              </TouchableOpacity>
+            </View>
+            
+            {renderNetworkList()}
+          </View>
+          
+          <View style={styles.form}>
+            <Text style={styles.sectionTitle}>수동 연결</Text>
+            <Input
+              label="WiFi 이름 (SSID)"
+              value={ssid}
+              onChangeText={setSsid}
+              placeholder="WiFi 이름을 입력하세요"
+              error={errors.ssid}
+              disabled={isSubmitting || isTestingConnection}
+            />
+            
+            <Input
+              label="비밀번호"
+              value={password}
+              onChangeText={setPassword}
+              placeholder="WiFi 비밀번호를 입력하세요 (없으면 빈칸)"
+              secureTextEntry
+              error={errors.password}
+              disabled={isSubmitting || isTestingConnection}
+            />
+            
+            {/* 수정된 버튼 - disabled 속성 제거하고 onPress 조건부 처리 */}
+            <TouchableOpacity 
+              style={[
+                styles.button, 
+                styles.primaryButton,
+                (isSubmitting || isTestingConnection) && styles.disabledButton
+              ]}
+              onPress={isSubmitting || isTestingConnection ? undefined : handleSetupWifi}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.buttonText}>
+                {isSubmitting ? '설정 중...' : 'WiFi 설정하기'}
+              </Text>
+              {isSubmitting && (
+                <ActivityIndicator 
+                  size="small" 
+                  color="#fff" 
+                  style={styles.buttonLoader} 
+                />
+              )}
+            </TouchableOpacity>
+            
+            {/* 수정된 나중에 설정하기 버튼 - disabled 속성 제거 */}
+            <TouchableOpacity 
+              style={[
+                styles.button, 
+                styles.outlineButton,
+                (isSubmitting || isTestingConnection) && styles.disabledButton
+              ]}
+              onPress={isSubmitting || isTestingConnection ? undefined : handleSkip}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.outlineButtonText}>나중에 설정하기</Text>
+            </TouchableOpacity>
+            
+            {/* 홈으로 강제 이동 버튼 */}
+            <TouchableOpacity 
+              style={[styles.button, styles.secondaryButton]}
+              onPress={forceNavigateToHome}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.buttonText}>홈으로 강제 이동 (디버깅용)</Text>
+            </TouchableOpacity>
+          </View>
+          
+          {/* 웹 환경에서 일반 HTML 버튼 테스트 */}
+          {Platform.OS === 'web' && (
+            <div style={{ marginTop: 20 }}>
+              <button 
+                onClick={forceNavigateToHome}
+                style={{ 
+                  padding: 10, 
+                  backgroundColor: 'red', 
+                  color: 'white', 
+                  border: 'none',
+                  borderRadius: 5,
+                  cursor: 'pointer',
+                  width: '100%',
+                  fontSize: 16
+                }}
+              >
+                HTML 홈으로 강제 이동
+              </button>
+            </div>
+          )}
+          
+          {isTestingConnection && (
+            <View style={styles.testingContainer}>
+              <ActivityIndicator color={Colors.primary} size="large" />
+              <Text style={styles.testingText}>
+                기기의 네트워크 연결을 테스트하는 중...
+              </Text>
+              <Text style={styles.testingSubtext}>
+                이 과정은 최대 30초가 소요될 수 있습니다.
+              </Text>
+            </View>
+          )}
+          
+          <Text style={styles.note}>
+            참고: WiFi 설정 후 기기가 새 네트워크에 연결될 때까지 잠시 기다려야 할 수 있습니다.
+          </Text>
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
+  );
+};
+  
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: Colors.background,
+    zIndex: 999, // 최상위 레이어로 설정
+  },
+  scrollContainer: {
+    flexGrow: 1,
+  },
+  content: {
+    flex: 1,
+    padding: 24,
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: Colors.primary,
+    marginBottom: 16,
+  },
+  deviceInfoContainer: {
+    backgroundColor: Colors.card,
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 24,
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 4,
+      },
+      web: {
+        boxShadow: '0 2px 4px rgba(0, 0, 0, 0.1)',
+      },
+    }),
+  },
+  deviceInfoTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    marginBottom: 8,
+    color: Colors.primary,
+  },
+  deviceInfo: {
+    fontSize: 14,
+    color: Colors.text,
+    marginBottom: 4,
+  },
+  instructions: {
+    fontSize: 16,
+    color: Colors.text,
+    marginBottom: 16,
+    lineHeight: 24,
+  },
+  
+  // WiFi 목록 관련 스타일
+  wifiListContainer: {
+    backgroundColor: Colors.card,
+    borderRadius: 12,
+    marginBottom: 24,
+    overflow: 'hidden',
+    ...Platform.select({
+      ios: {
+        shadowColor: '#000',
+        shadowOffset: { width: 0, height: 2 },
+        shadowOpacity: 0.1,
+        shadowRadius: 4,
+      },
+      android: {
+        elevation: 4,
+      },
+      web: {
+        boxShadow: '0 2px 4px rgba(0, 0, 0, 0.1)',
+      },
+    }),
+  },
+  wifiListHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.lightGray,
+  },
+  wifiListTitle: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: Colors.text,
+  },
+  scanButton: {
+    padding: 8,
+  },
+  networkListContainer: {
+    maxHeight: 300,
+    ...(Platform.OS === 'web' ? {
+      overflowY: 'auto',
+      WebkitOverflowScrolling: 'touch'
+    } : {})
+  },
+  scanningIndicator: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 12,
+    backgroundColor: Colors.lightBackground,
+  },
+  scanningText: {
+    marginLeft: 8,
+    color: Colors.text,
+    fontSize: 14,
+  },
+  networkItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    padding: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.lightGray,
+  },
+  networkIconContainer: {
+    marginRight: 12,
+  },
+  networkInfo: {
+    flex: 1,
+  },
+  networkName: {
+    fontSize: 16,
+    fontWeight: '500',
+    color: Colors.text,
+    marginBottom: 4,
+  },
+  networkDetails: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  securityIcon: {
+    marginRight: 4,
+  },
+  networkSecurity: {
+    fontSize: 12,
+    color: Colors.darkGray,
+  },
+  emptyNetworkContainer: {
+    padding: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  emptyNetworkText: {
+    fontSize: 14,
+    color: Colors.darkGray,
+    marginBottom: 16,
+    textAlign: 'center',
+  },
+  refreshButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    backgroundColor: Colors.primary,
+    borderRadius: 8,
+  },
+  refreshButtonText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  
+  sectionTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    color: Colors.text,
+    marginBottom: 16,
+    marginTop: 8,
+  },
+  form: {
+    marginBottom: 24,
+  },
+  // 직접 구현한 버튼 스타일
+  button: {
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 20,
+    marginVertical: 8,
+    flexDirection: 'row',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  primaryButton: {
+    backgroundColor: Colors.primary,
+  },
+  secondaryButton: {
+    backgroundColor: Colors.secondary || '#666',
+  },
+  testButton: {
+    backgroundColor: 'green',
+  },
+  outlineButton: {
+    backgroundColor: 'transparent',
+    borderWidth: 1,
+    borderColor: Colors.primary,
+  },
+  disabledButton: {
+    opacity: 0.6,
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  outlineButtonText: {
+    color: Colors.primary,
+    fontSize: 16,
+    fontWeight: '600',
+    textAlign: 'center',
+  },
+  buttonLoader: {
+    marginLeft: 8,
+  },
+  testingContainer: {
+    backgroundColor: Colors.lightGray,
+    borderRadius: 12,
+    padding: 20,
+    alignItems: 'center',
+    marginBottom: 24,
+  },
+  testingText: {
+    fontSize: 16,
+    color: Colors.text,
+    marginTop: 16,
+    textAlign: 'center',
+  },
+  testingSubtext: {
+    fontSize: 14,
+    color: Colors.darkGray,
+    marginTop: 8,
+    textAlign: 'center',
+  },
+  note: {
+    fontSize: 14,
+    color: Colors.darkGray,
+    fontStyle: 'italic',
+  },
+});
+  
+export default WifiSetupScreen;
